@@ -174,5 +174,65 @@ a_ptrs += 64, b_ptrs += 64 * N   # Moving K slice down B means jump 64*N element
 acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
 acc += tl.dot(a, b)
 ```
-8. Interesting Part: L2 Optimization
 
+# GEMM Kernel Notes — L2 Cache Optimization (Block Ordering)
+
+## Accumulation
+
+```
+acc += tile.dot(a, b)
+```
+
+After all K-tiles are processed, the accumulator holds `A_tile @ B_tile`.
+Inputs are FP16, accumulation happens in FP32.
+
+---
+
+## 8. The Interesting Part: L2 Optimization
+
+The idea: the **order** in which thread blocks are launched changes how many
+A/B tiles get *re-loaded* from global memory vs. reused from L2 cache — even
+though the math and output are identical.
+
+### Row-major ordering
+
+```
+   A                    B                      C
+┌───┬───┐        ┌───┬───┬───┬───┐        ┌───┬───┬───┬───┐
+│▓▓▓│▓▓▓│        │▓▓▓│▓▓▓│▓▓▓│▓▓▓│        │ 0 │ 1 │ 2 │ 3 │
+├───┼───┤   x    ├───┼───┼───┼───┤   =    ├───┼───┼───┼───┤
+│▓▓▓│▓▓▓│        │▓▓▓│▓▓▓│▓▓▓│▓▓▓│        │   │   │   │   │
+└───┴───┘        └───┴───┴───┴───┘        └───┴───┴───┴───┘
+load 4 blocks     load 16 blocks             write 4 blocks
+```
+
+- Loads **4** blocks of `A`, **16** blocks of `B`
+- Simple, but re-fetches the same `B` tiles repeatedly across rows
+
+### Grouped ordering
+
+```
+   A                    B                      C
+┌───┬───┐        ┌───┬───┐                ┌───┬───┐
+│▓▓▓│▓▓▓│        │▓▓▓│▓▓▓│                │ 0 │ 2 │
+├───┼───┤   x    ├───┼───┤        =       ├───┼───┤
+│▓▓▓│▓▓▓│        │▓▓▓│▓▓▓│                │ 1 │ 3 │
+└───┴───┘        └───┴───┘                └───┴───┘
+load 8 blocks     load 9 blocks              write 4 blocks
+```
+
+- Groups neighboring output tiles so their shared `A`/`B` tiles stay hot in L2
+- Loads **8** blocks of `A`, **9** blocks of `B`
+
+---
+
+## Scaling to a 4×4 output tile grid
+
+| Ordering       | Blocks loaded (A + B) to write all output blocks |
+|----------------|----------------------------------------------------|
+| Row-major      | 24                                                   |
+| Grouped        | 16                                                   |
+
+**Takeaway:** grouped (tile-swizzled) ordering trades a slightly more complex
+index calculation for significantly better L2 reuse — fewer global memory
+loads for the same output.
